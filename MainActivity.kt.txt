@@ -1,0 +1,397 @@
+package com.hyperion.audio
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.DocumentsContract
+import android.provider.OpenableColumns
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
+
+class MainActivity : AppCompatActivity() {
+
+    companion object {
+        var instance: MainActivity? = null
+        private const val REQ_PICK_FOLDER = 101
+        private const val REQ_PICK_FILES = 102
+        private const val REQ_PERMS = 103
+    }
+
+    private lateinit var webView: WebView
+    private var currentTargetFolder: String = "WSZYSTKIE UTWORY"
+
+    @SuppressLint("SetJavaScriptEnabled")
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        instance = this
+
+        supportActionBar?.hide()
+
+        webView = WebView(this).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.allowFileAccess = true
+            settings.allowContentAccess = true
+            webViewClient = WebViewClient()
+            webChromeClient = WebChromeClient()
+            addJavascriptInterface(HyperionJsBridge(), "HyperionBridge")
+        }
+
+        setContentView(webView)
+        checkStoragePermissions()
+
+        val serviceIntent = Intent(this, HyperionMediaService::class.java)
+        ContextCompat.startForegroundService(this, serviceIntent)
+
+        webView.loadUrl("file:///android_asset/index.html")
+    }
+
+    private fun checkStoragePermissions() {
+        val perms = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                perms.add(Manifest.permission.READ_MEDIA_AUDIO)
+            }
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                perms.add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        } else {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                perms.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            }
+        }
+        if (perms.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, perms.toTypedArray(), REQ_PERMS)
+        }
+    }
+
+    inner class HyperionJsBridge {
+
+        @JavascriptInterface
+        fun getLibrary(): String {
+            val prefs = getSharedPreferences("hyperion_prefs", Context.MODE_PRIVATE)
+            return prefs.getString("native_tracks_v2", "[]") ?: "[]"
+        }
+
+        @JavascriptInterface
+        fun getWrappedStats(): String {
+            val prefs = getSharedPreferences("hyperion_prefs", Context.MODE_PRIVATE)
+            return prefs.getString("wrapped_stats_v1", "{}") ?: "{}"
+        }
+
+        @JavascriptInterface
+        fun updateLibraryJson(jsonStr: String) {
+            val prefs = getSharedPreferences("hyperion_prefs", Context.MODE_PRIVATE)
+            prefs.edit().putString("native_tracks_v2", jsonStr).apply()
+            HyperionMediaService.instance?.notifyLibraryChanged()
+        }
+
+        @JavascriptInterface
+        fun setCurrentFolder(folderName: String) {
+            currentTargetFolder = folderName
+        }
+
+        @JavascriptInterface
+        fun pickEntireFolder() {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            }
+            startActivityForResult(intent, REQ_PICK_FOLDER)
+        }
+
+        @JavascriptInterface
+        fun pickSingleOrMultipleFiles(targetFolder: String) {
+            currentTargetFolder = targetFolder
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "audio/*"
+                putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivityForResult(intent, REQ_PICK_FILES)
+        }
+
+        @JavascriptInterface
+        fun playIndex(idx: Int) {
+            HyperionMediaService.instance?.playTrack(idx, 0)
+        }
+
+        @JavascriptInterface
+        fun play() {
+            HyperionMediaService.instance?.resumePlayback()
+        }
+
+        @JavascriptInterface
+        fun pause() {
+            HyperionMediaService.instance?.pausePlayback()
+        }
+
+        @JavascriptInterface
+        fun next() {
+            HyperionMediaService.instance?.playNext()
+        }
+
+        @JavascriptInterface
+        fun prev() {
+            HyperionMediaService.instance?.playPrevious()
+        }
+
+        @JavascriptInterface
+        fun seekTo(seconds: Long) {
+            HyperionMediaService.instance?.seekTo(seconds)
+        }
+
+        @JavascriptInterface
+        fun setShuffle(enabled: Boolean) {
+            HyperionMediaService.instance?.setShuffleState(enabled)
+        }
+
+        @JavascriptInterface
+        fun setLoop(enabled: Boolean) {
+            HyperionMediaService.instance?.setLoopState(enabled)
+        }
+
+        @JavascriptInterface
+        fun setBass(db: Int) {
+            HyperionMediaService.instance?.setBass(db)
+        }
+
+        @JavascriptInterface
+        fun setVolume(pct: Int) {
+            HyperionMediaService.instance?.setVolumeBoost(pct)
+        }
+
+        @JavascriptInterface
+        fun setCustomColor(hex: String) {
+            val prefs = getSharedPreferences("hyperion_prefs", Context.MODE_PRIVATE)
+            prefs.edit().putString("app_color_hex", hex).apply()
+            HyperionMediaService.instance?.updateThemeColor()
+        }
+
+        @JavascriptInterface
+        fun deleteTrack(idx: Int) {
+            val prefs = getSharedPreferences("hyperion_prefs", Context.MODE_PRIVATE)
+            val raw = prefs.getString("native_tracks_v2", "[]") ?: "[]"
+            val arr = JSONArray(raw)
+            if (idx < 0 || idx >= arr.length()) return
+
+            val newArr = JSONArray()
+            for (i in 0 until arr.length()) {
+                if (i == idx) {
+                    val obj = arr.getJSONObject(i)
+                    val p = obj.optString("path", "")
+                    if (p.isNotEmpty()) {
+                        try { File(p).delete() } catch (e: Exception) {}
+                    }
+                } else {
+                    newArr.put(arr.getJSONObject(i))
+                }
+            }
+            prefs.edit().putString("native_tracks_v2", newArr.toString()).apply()
+            HyperionMediaService.instance?.notifyLibraryChanged()
+
+            runOnUiThread {
+                webView.evaluateJavascript("window.onLibraryReload(${newArr});", null)
+            }
+        }
+
+        @JavascriptInterface
+        fun requestSyncState() {
+            val info = HyperionMediaService.instance?.getCurrentPlaybackInfo()
+            if (info != null) {
+                runOnUiThread {
+                    webView.evaluateJavascript("window.onNativeStateSync($info);", null)
+                }
+            }
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (resultCode != Activity.RESULT_OK || data == null) return
+
+        if (requestCode == REQ_PICK_FOLDER) {
+            val treeUri = data.data ?: return
+            Thread {
+                importFolderFromUri(treeUri)
+            }.start()
+        } else if (requestCode == REQ_PICK_FILES) {
+            val uris = mutableListOf<Uri>()
+            val clip = data.clipData
+            if (clip != null) {
+                for (i in 0 until clip.itemCount) {
+                    uris.add(clip.getItemAt(i).uri)
+                }
+            } else {
+                data.data?.let { uris.add(it) }
+            }
+            if (uris.isNotEmpty()) {
+                Thread {
+                    importFilesToFolder(uris, currentTargetFolder)
+                }.start()
+            }
+        }
+    }
+
+    private fun importFilesToFolder(uris: List<Uri>, folderName: String) {
+        val prefs = getSharedPreferences("hyperion_prefs", Context.MODE_PRIVATE)
+        val raw = prefs.getString("native_tracks_v2", "[]") ?: "[]"
+        val arr = JSONArray(raw)
+
+        val destDir = File(filesDir, "music")
+        if (!destDir.exists()) destDir.mkdirs()
+
+        val targetFolderClean = if (folderName.isBlank()) "WSZYSTKIE UTWORY" else folderName
+
+        for (uri in uris) {
+            val displayName = getFileName(uri) ?: "Utwor_${System.currentTimeMillis()}.mp3"
+            val cleanTitle = displayName.substringBeforeLast(".")
+            val safeFileName = "${System.currentTimeMillis()}_${displayName.replace("[^a-zA-Z0-9._-]".toRegex(), "_")}"
+            val outFile = File(destDir, safeFileName)
+
+            try {
+                contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(outFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                val obj = JSONObject().apply {
+                    put("title", cleanTitle)
+                    put("path", outFile.absolutePath)
+                    put("folder", targetFolderClean)
+                }
+                arr.put(obj)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+
+        prefs.edit().putString("native_tracks_v2", arr.toString()).apply()
+        HyperionMediaService.instance?.notifyLibraryChanged()
+
+        runOnUiThread {
+            val safeFolderJs = targetFolderClean.replace("'", "\\'")
+            webView.evaluateJavascript("window.onFolderImported('$safeFolderJs', ${arr});", null)
+        }
+    }
+
+    private fun importFolderFromUri(treeUri: Uri) {
+        val prefs = getSharedPreferences("hyperion_prefs", Context.MODE_PRIVATE)
+        val raw = prefs.getString("native_tracks_v2", "[]") ?: "[]"
+        val arr = JSONArray(raw)
+
+        val destDir = File(filesDir, "music")
+        if (!destDir.exists()) destDir.mkdirs()
+
+        val docId = DocumentsContract.getTreeDocumentId(treeUri)
+        val folderRawName = docId.substringAfterLast("/").substringAfterLast(":").trim()
+        val folderName = if (folderRawName.isNotEmpty()) folderRawName.uppercase() else "NOWY KATALOG"
+
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE
+        )
+
+        contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+            val idIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val mimeIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+
+            while (cursor.moveToNext()) {
+                val childId = cursor.getString(idIdx)
+                val name = cursor.getString(nameIdx) ?: continue
+                val mime = cursor.getString(mimeIdx) ?: ""
+
+                val isAudio = mime.startsWith("audio/") ||
+                        name.endsWith(".mp3", true) ||
+                        name.endsWith(".wav", true) ||
+                        name.endsWith(".flac", true) ||
+                        name.endsWith(".m4a", true) ||
+                        name.endsWith(".ogg", true)
+
+                if (isAudio) {
+                    val fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, childId)
+                    val cleanTitle = name.substringBeforeLast(".")
+                    val safeFileName = "${System.currentTimeMillis()}_${name.replace("[^a-zA-Z0-9._-]".toRegex(), "_")}"
+                    val outFile = File(destDir, safeFileName)
+
+                    try {
+                        contentResolver.openInputStream(fileUri)?.use { input ->
+                            FileOutputStream(outFile).use { output ->
+                                input.copyTo(output)
+                            }
+                        }
+                        val obj = JSONObject().apply {
+                            put("title", cleanTitle)
+                            put("path", outFile.absolutePath)
+                            put("folder", folderName)
+                        }
+                        arr.put(obj)
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+            }
+        }
+
+        prefs.edit().putString("native_tracks_v2", arr.toString()).apply()
+        HyperionMediaService.instance?.notifyLibraryChanged()
+
+        runOnUiThread {
+            val safeFolderJs = folderName.replace("'", "\\'")
+            webView.evaluateJavascript("window.onFolderImported('$safeFolderJs', ${arr});", null)
+        }
+    }
+
+    private fun getFileName(uri: Uri): String? {
+        var name: String? = null
+        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0) name = cursor.getString(idx)
+            }
+        }
+        return name ?: uri.lastPathSegment
+    }
+
+    fun syncStateToWeb(
+        title: String,
+        isPlaying: Boolean,
+        posSec: Long,
+        durSec: Long,
+        idx: Int,
+        artBase64: String,
+        shuffle: Boolean,
+        loop: Boolean
+    ) {
+        val safeTitle = title.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ")
+        val js = "if(window.onNativeTrackChange) window.onNativeTrackChange('$safeTitle', $isPlaying, $posSec, $durSec, $idx, '$artBase64', $shuffle, $loop);"
+        webView.evaluateJavascript(js, null)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val info = HyperionMediaService.instance?.getCurrentPlaybackInfo()
+        if (info != null) {
+            webView.evaluateJavascript("if(window.onNativeStateSync) window.onNativeStateSync($info);", null)
+        }
+    }
+}

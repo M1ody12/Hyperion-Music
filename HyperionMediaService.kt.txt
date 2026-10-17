@@ -1,0 +1,956 @@
+package com.hyperion.audio
+
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.media.MediaMetadataRetriever
+import android.media.MediaPlayer
+import android.media.audiofx.BassBoost
+import android.media.audiofx.LoudnessEnhancer
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.PowerManager
+import android.support.v4.media.MediaBrowserCompat
+import android.support.v4.media.MediaDescriptionCompat
+import android.support.v4.media.MediaMetadataCompat
+import android.support.v4.media.session.MediaSessionCompat
+import android.support.v4.media.session.PlaybackStateCompat
+import android.util.Base64
+import androidx.core.app.NotificationCompat
+import androidx.media.MediaBrowserServiceCompat
+import androidx.media.app.NotificationCompat.MediaStyle
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.text.Collator
+import java.util.Locale
+
+class HyperionMediaService : MediaBrowserServiceCompat(), AudioManager.OnAudioFocusChangeListener {
+
+    companion object {
+        const val MEDIA_ROOT_ID = "hyperion_root"
+        const val ROOT_FOLDERS_ID = "root_folders"
+        const val FOLDER_PREFIX = "folder_"
+        const val TRACK_PREFIX = "track_"
+        const val ACTION_SHUFFLE_ALL_LIBRARY = "action_shuffle_all_library"
+        const val CHANNEL_ID = "hyperion_playback_channel"
+        const val NOTIFICATION_ID = 404
+
+        const val ACTION_PREV = "com.hyperion.audio.ACTION_PREV"
+        const val ACTION_PLAY = "com.hyperion.audio.ACTION_PLAY"
+        const val ACTION_PAUSE = "com.hyperion.audio.ACTION_PAUSE"
+        const val ACTION_NEXT = "com.hyperion.audio.ACTION_NEXT"
+
+        const val CUSTOM_ACTION_SHUFFLE = "com.hyperion.audio.CUSTOM_SHUFFLE"
+        const val CUSTOM_ACTION_LOOP = "com.hyperion.audio.CUSTOM_LOOP"
+
+        const val CONTENT_STYLE_SUPPORTED = "android.media.browse.CONTENT_STYLE_SUPPORTED"
+        const val CONTENT_STYLE_BROWSABLE_HINT = "android.media.browse.CONTENT_STYLE_BROWSABLE_HINT"
+        const val CONTENT_STYLE_PLAYABLE_HINT = "android.media.browse.CONTENT_STYLE_PLAYABLE_HINT"
+        const val CONTENT_STYLE_LIST_ITEM_HINT_VALUE = 1
+
+        var instance: HyperionMediaService? = null
+    }
+
+    private lateinit var mediaSession: MediaSessionCompat
+    private var mediaPlayer: MediaPlayer? = null
+    private lateinit var audioManager: AudioManager
+    private var audioFocusRequest: AudioFocusRequest? = null
+
+    private var resumeOnFocusGain: Boolean = false
+
+    private var bassBoost: BassBoost? = null
+    private var loudnessEnhancer: LoudnessEnhancer? = null
+    private var currentBassDb: Int = 0
+    private var currentVolPercent: Int = 100
+
+    var isFolderShuffle: Boolean = false
+    var isGlobalShuffle: Boolean = false
+    var isLoop: Boolean = false
+
+    var currentIndex: Int = -1
+    private var savedResumePositionMs: Int = 0
+    private var savedDurationSec: Long = 0L
+
+    private val tracks = mutableListOf<TrackItem>()
+    private val folders = mutableListOf<String>()
+
+    private var currentArtwork: Bitmap? = null
+    private var currentArtworkBase64: String = ""
+
+    // Handler zapisujący co 5 sekund dokładną sekundę utworu oraz statystyki słuchania
+    private val statsHandler = Handler(Looper.getMainLooper())
+    private val statsRunnable = object : Runnable {
+        override fun run() {
+            if (mediaPlayer?.isPlaying == true && currentIndex in tracks.indices) {
+                val posMs = mediaPlayer?.currentPosition ?: 0
+                savedResumePositionMs = posMs
+                getSharedPreferences("hyperion_prefs", Context.MODE_PRIVATE)
+                    .edit()
+                    .putInt("last_track_index", currentIndex)
+                    .putInt("last_track_pos_ms", posMs)
+                    .apply()
+
+                recordListeningTime(tracks[currentIndex], 5)
+            }
+            statsHandler.postDelayed(this, 5000L)
+        }
+    }
+
+    data class TrackItem(val index: Int, val title: String, val path: String, val folder: String)
+
+    override fun onCreate() {
+        super.onCreate()
+        instance = this
+
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        createNotificationChannel()
+        loadTracksFromStorage()
+
+        val prefs = getSharedPreferences("hyperion_prefs", Context.MODE_PRIVATE)
+        val savedIndex = prefs.getInt("last_track_index", 0)
+        savedResumePositionMs = prefs.getInt("last_track_pos_ms", 0)
+
+        if (tracks.isNotEmpty()) {
+            currentIndex = if (savedIndex in tracks.indices) savedIndex else 0
+            val savedTrack = tracks[currentIndex]
+            currentArtwork = getTrackArtwork(savedTrack.path)
+            currentArtworkBase64 = bitmapToBase64(currentArtwork!!)
+            savedDurationSec = getTrackDurationSec(savedTrack.path)
+        }
+
+        mediaSession = MediaSessionCompat(this, "HyperionAutoSession").apply {
+            setCallback(object : MediaSessionCompat.Callback() {
+                override fun onPlay() { resumePlayback() }
+                override fun onPause() { pausePlayback() }
+                override fun onSkipToNext() { playNext() }
+                override fun onSkipToPrevious() { playPrevious() }
+
+                override fun onCustomAction(action: String?, extras: Bundle?) {
+                    when (action) {
+                        CUSTOM_ACTION_SHUFFLE -> {
+                            if (isFolderShuffle || isGlobalShuffle) {
+                                isFolderShuffle = false
+                                isGlobalShuffle = false
+                            } else {
+                                isFolderShuffle = true
+                                isGlobalShuffle = false
+                            }
+                            val pos = (mediaPlayer?.currentPosition ?: savedResumePositionMs) / 1000L
+                            updatePlaybackState(mediaPlayer?.isPlaying == true, pos)
+                            notifyUi()
+                        }
+                        CUSTOM_ACTION_LOOP -> {
+                            isLoop = !isLoop
+                            val pos = (mediaPlayer?.currentPosition ?: savedResumePositionMs) / 1000L
+                            updatePlaybackState(mediaPlayer?.isPlaying == true, pos)
+                            notifyUi()
+                        }
+                    }
+                }
+
+                override fun onPlayFromMediaId(mediaId: String?, extras: Bundle?) {
+                    if (mediaId == ACTION_SHUFFLE_ALL_LIBRARY) {
+                        playAllRandom()
+                        return
+                    }
+                    if (mediaId != null && mediaId.startsWith(TRACK_PREFIX)) {
+                        val idx = mediaId.removePrefix(TRACK_PREFIX).toIntOrNull() ?: 0
+                        isGlobalShuffle = false
+                        playTrack(idx, 0)
+                    }
+                }
+
+                override fun onSeekTo(pos: Long) {
+                    seekTo(pos / 1000)
+                }
+            })
+            isActive = true
+        }
+
+        sessionToken = mediaSession.sessionToken
+
+        if (currentIndex in tracks.indices) {
+            val t = tracks[currentIndex]
+            updateMetadata(t.title, t.folder, savedDurationSec, currentArtwork)
+        }
+        updatePlaybackState(false, savedResumePositionMs / 1000L)
+        statsHandler.postDelayed(statsRunnable, 5000L)
+    }
+
+    private fun recordListeningTime(track: TrackItem, seconds: Int) {
+        val prefs = getSharedPreferences("hyperion_prefs", Context.MODE_PRIVATE)
+        val raw = prefs.getString("wrapped_stats_v1", "{}") ?: "{}"
+        try {
+            val root = JSONObject(raw)
+            val totalSec = root.optLong("totalSeconds", 0L) + seconds
+            root.put("totalSeconds", totalSec)
+
+            val foldersObj = root.optJSONObject("folders") ?: JSONObject()
+            val folderKey = if (track.folder.isBlank()) "WSZYSTKIE UTWORY" else track.folder
+            foldersObj.put(folderKey, foldersObj.optLong(folderKey, 0L) + seconds)
+            root.put("folders", foldersObj)
+
+            val tracksObj = root.optJSONObject("tracks") ?: JSONObject()
+            val trackKey = track.title
+            tracksObj.put(trackKey, tracksObj.optLong(trackKey, 0L) + seconds)
+            root.put("tracks", tracksObj)
+
+            prefs.edit().putString("wrapped_stats_v1", root.toString()).apply()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun getTrackDurationSec(path: String): Long {
+        val mmr = MediaMetadataRetriever()
+        return try {
+            mmr.setDataSource(path)
+            val durStr = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+            (durStr?.toLongOrNull() ?: 0L) / 1000L
+        } catch (e: Exception) {
+            0L
+        } finally {
+            try { mmr.release() } catch (e: Exception) {}
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_PREV -> playPrevious()
+            ACTION_PAUSE -> pausePlayback()
+            ACTION_PLAY -> resumePlayback()
+            ACTION_NEXT -> playNext()
+        }
+        return super.onStartCommand(intent, flags, startId)
+    }
+
+    override fun onGetRoot(clientPackageName: String, clientUid: Int, rootHints: Bundle?): BrowserRoot {
+        val rootExtras = Bundle().apply {
+            putBoolean(CONTENT_STYLE_SUPPORTED, true)
+            putInt(CONTENT_STYLE_BROWSABLE_HINT, CONTENT_STYLE_LIST_ITEM_HINT_VALUE)
+            putInt(CONTENT_STYLE_PLAYABLE_HINT, CONTENT_STYLE_LIST_ITEM_HINT_VALUE)
+        }
+        return BrowserRoot(MEDIA_ROOT_ID, rootExtras)
+    }
+
+    override fun onLoadChildren(parentId: String, result: Result<MutableList<MediaBrowserCompat.MediaItem>>) {
+        loadTracksFromStorage()
+        val mediaItems = mutableListOf<MediaBrowserCompat.MediaItem>()
+
+        val itemExtras = Bundle().apply {
+            putInt(CONTENT_STYLE_BROWSABLE_HINT, CONTENT_STYLE_LIST_ITEM_HINT_VALUE)
+            putInt(CONTENT_STYLE_PLAYABLE_HINT, CONTENT_STYLE_LIST_ITEM_HINT_VALUE)
+        }
+
+        val shuffleAllItem = MediaBrowserCompat.MediaItem(
+            MediaDescriptionCompat.Builder()
+                .setMediaId(ACTION_SHUFFLE_ALL_LIBRARY)
+                .setTitle("🔀 ODTWÓRZ WSZYSTKO LOSOWO")
+                .setSubtitle("Wszystkie katalogi • Cała pamięć")
+                .setExtras(itemExtras)
+                .build(),
+            MediaBrowserCompat.MediaItem.FLAG_PLAYABLE
+        )
+
+        if (parentId == MEDIA_ROOT_ID) {
+            val rootDesc = MediaDescriptionCompat.Builder()
+                .setMediaId(ROOT_FOLDERS_ID)
+                .setTitle("KATALOGI")
+                .setSubtitle("Dotknij, aby wybrać katalog")
+                .setExtras(itemExtras)
+                .build()
+            mediaItems.add(MediaBrowserCompat.MediaItem(rootDesc, MediaBrowserCompat.MediaItem.FLAG_BROWSABLE))
+            result.sendResult(mediaItems)
+        } else if (parentId == ROOT_FOLDERS_ID) {
+            if (tracks.isEmpty()) {
+                val emptyDesc = MediaDescriptionCompat.Builder()
+                    .setMediaId("placeholder")
+                    .setTitle("Brak utworów w pamięci")
+                    .setSubtitle("Wgraj muzykę na telefonie")
+                    .build()
+                mediaItems.add(MediaBrowserCompat.MediaItem(emptyDesc, MediaBrowserCompat.MediaItem.FLAG_PLAYABLE))
+                result.sendResult(mediaItems)
+                return
+            }
+
+            mediaItems.add(shuffleAllItem)
+
+            val allDesc = MediaDescriptionCompat.Builder()
+                .setMediaId("${FOLDER_PREFIX}ALL")
+                .setTitle("📁 Wszystkie utwory")
+                .setSubtitle("${tracks.size} utworów")
+                .setExtras(itemExtras)
+                .build()
+            mediaItems.add(MediaBrowserCompat.MediaItem(allDesc, MediaBrowserCompat.MediaItem.FLAG_BROWSABLE))
+
+            val favFolder = folders.firstOrNull { it.equals("ULUBIONE", ignoreCase = true) }
+            if (favFolder != null) {
+                val count = tracks.count { it.folder.equals(favFolder, ignoreCase = true) }
+                val folderDesc = MediaDescriptionCompat.Builder()
+                    .setMediaId("${FOLDER_PREFIX}$favFolder")
+                    .setTitle("⭐ $favFolder")
+                    .setSubtitle("$count utworów")
+                    .setExtras(itemExtras)
+                    .build()
+                mediaItems.add(MediaBrowserCompat.MediaItem(folderDesc, MediaBrowserCompat.MediaItem.FLAG_BROWSABLE))
+            }
+
+            val collator = Collator.getInstance(Locale("pl", "PL"))
+            val restSorted = folders.filter {
+                !it.equals("WSZYSTKIE UTWORY", ignoreCase = true) &&
+                        !it.equals("ULUBIONE", ignoreCase = true)
+            }.sortedWith(collator)
+
+            for (f in restSorted) {
+                val count = tracks.count { it.folder.equals(f, ignoreCase = true) }
+                val folderDesc = MediaDescriptionCompat.Builder()
+                    .setMediaId("${FOLDER_PREFIX}$f")
+                    .setTitle("📁 $f")
+                    .setSubtitle("$count utworów")
+                    .setExtras(itemExtras)
+                    .build()
+                mediaItems.add(MediaBrowserCompat.MediaItem(folderDesc, MediaBrowserCompat.MediaItem.FLAG_BROWSABLE))
+            }
+            result.sendResult(mediaItems)
+        } else if (parentId.startsWith(FOLDER_PREFIX)) {
+            val targetFolder = parentId.removePrefix(FOLDER_PREFIX)
+            val filtered = if (targetFolder == "ALL") tracks else tracks.filter { it.folder.equals(targetFolder, ignoreCase = true) }
+
+            if (tracks.size > 1) {
+                mediaItems.add(shuffleAllItem)
+            }
+
+            for (t in filtered) {
+                val trackDesc = MediaDescriptionCompat.Builder()
+                    .setMediaId("$TRACK_PREFIX${t.index}")
+                    .setTitle(t.title)
+                    .setSubtitle(t.folder)
+                    .setExtras(itemExtras)
+                    .build()
+                mediaItems.add(MediaBrowserCompat.MediaItem(trackDesc, MediaBrowserCompat.MediaItem.FLAG_PLAYABLE))
+            }
+            result.sendResult(mediaItems)
+        } else {
+            result.sendResult(mediaItems)
+        }
+    }
+
+    private fun requestCarAudioFocus(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val playbackAttributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .build()
+
+            val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(playbackAttributes)
+                .setAcceptsDelayedFocusGain(false)
+                .setOnAudioFocusChangeListener(this)
+                .build()
+
+            this.audioFocusRequest = focusRequest
+            audioManager.requestAudioFocus(focusRequest) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.requestAudioFocus(this, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        }
+    }
+
+    override fun onAudioFocusChange(focusChange: Int) {
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                val wasPlaying = mediaPlayer?.isPlaying == true
+                if (wasPlaying) {
+                    resumeOnFocusGain = true
+                    saveCurrentProgress()
+                    mediaPlayer?.pause()
+                    val pos = (mediaPlayer?.currentPosition ?: savedResumePositionMs) / 1000L
+                    updatePlaybackState(false, pos)
+                    notifyUi()
+                }
+            }
+            AudioManager.AUDIOFOCUS_LOSS -> {
+                resumeOnFocusGain = false
+                pausePlayback()
+            }
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                if (resumeOnFocusGain && mediaPlayer != null) {
+                    resumeOnFocusGain = false
+                    mediaPlayer?.start()
+                    val pos = (mediaPlayer?.currentPosition ?: 0) / 1000L
+                    updatePlaybackState(true, pos)
+                    val title = if (currentIndex in tracks.indices) tracks[currentIndex].title else "Hyperion"
+                    startForegroundWithNotification(title, true)
+                    notifyUi()
+                }
+            }
+        }
+    }
+
+    private fun saveCurrentProgress() {
+        val posMs = mediaPlayer?.currentPosition ?: savedResumePositionMs
+        savedResumePositionMs = posMs
+        if (currentIndex >= 0) {
+            getSharedPreferences("hyperion_prefs", Context.MODE_PRIVATE)
+                .edit()
+                .putInt("last_track_index", currentIndex)
+                .putInt("last_track_pos_ms", posMs)
+                .apply()
+        }
+    }
+
+    fun loadTracksFromStorage() {
+        tracks.clear()
+        folders.clear()
+        folders.add("WSZYSTKIE UTWORY")
+        folders.add("ULUBIONE")
+
+        val prefs = getSharedPreferences("hyperion_prefs", Context.MODE_PRIVATE)
+        val jsonStr = prefs.getString("native_tracks_v2", null)
+
+        if (!jsonStr.isNullOrEmpty()) {
+            try {
+                val arr = JSONArray(jsonStr)
+                for (i in 0 until arr.length()) {
+                    val obj = arr.getJSONObject(i)
+                    val f = obj.optString("folder", "WSZYSTKIE UTWORY")
+                    if (!folders.any { it.equals(f, ignoreCase = true) }) {
+                        folders.add(f)
+                    }
+                    tracks.add(
+                        TrackItem(
+                            index = i,
+                            title = obj.getString("title"),
+                            path = obj.getString("path"),
+                            folder = f
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    private fun getSavedColor(): Int {
+        val prefs = getSharedPreferences("hyperion_prefs", Context.MODE_PRIVATE)
+        val hex = prefs.getString("app_color_hex", "#ffc400") ?: "#ffc400"
+        return try {
+            Color.parseColor(hex)
+        } catch (e: Exception) {
+            Color.parseColor("#ffc400")
+        }
+    }
+
+    private fun getTrackArtwork(path: String): Bitmap {
+        val mmr = MediaMetadataRetriever()
+        try {
+            mmr.setDataSource(path)
+            val rawArt = mmr.embeddedPicture
+            if (rawArt != null) {
+                val bmp = BitmapFactory.decodeByteArray(rawArt, 0, rawArt.size)
+                if (bmp != null) {
+                    return addHyperionFrame(bmp, getSavedColor())
+                }
+            }
+        } catch (e: Exception) {
+        } finally {
+            try { mmr.release() } catch (e: Exception) {}
+        }
+        return createDefaultHyperionArtwork(getSavedColor())
+    }
+
+    private fun addHyperionFrame(src: Bitmap, colorInt: Int): Bitmap {
+        val size = 512
+        val framed = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(framed)
+        val framePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = colorInt
+        }
+        canvas.drawRect(0f, 0f, size.toFloat(), size.toFloat(), framePaint)
+
+        val inset = 96f
+        val innerSize = (size - 2 * inset).toInt()
+        val scaled = Bitmap.createScaledBitmap(src, innerSize, innerSize, true)
+        canvas.drawBitmap(scaled, inset, inset, null)
+        return framed
+    }
+
+    private fun createDefaultHyperionArtwork(colorInt: Int): Bitmap {
+        val size = 512
+        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+        paint.color = colorInt
+        canvas.drawRect(0f, 0f, size.toFloat(), size.toFloat(), paint)
+
+        val inset = 96f
+        paint.color = Color.parseColor("#0A0D11")
+        paint.style = Paint.Style.FILL
+        canvas.drawRect(inset, inset, (size - inset).toFloat(), (size - inset).toFloat(), paint)
+
+        paint.color = colorInt
+        paint.textSize = 170f
+        paint.textAlign = Paint.Align.CENTER
+        paint.isFakeBoldText = true
+        val yPos = (size / 2 - (paint.descent() + paint.ascent()) / 2)
+        canvas.drawText("H", (size / 2).toFloat(), yPos, paint)
+
+        return bitmap
+    }
+
+    fun updateThemeColor() {
+        if (currentIndex in tracks.indices) {
+            val track = tracks[currentIndex]
+            currentArtwork = getTrackArtwork(track.path)
+            currentArtworkBase64 = bitmapToBase64(currentArtwork!!)
+            val durSec = if (mediaPlayer != null) (mediaPlayer?.duration ?: 0) / 1000L else savedDurationSec
+            updateMetadata(track.title, track.folder, durSec, currentArtwork)
+            startForegroundWithNotification(track.title, mediaPlayer?.isPlaying == true)
+            notifyUi()
+        }
+    }
+
+    private fun bitmapToBase64(bitmap: Bitmap): String {
+        val outputStream = ByteArrayOutputStream()
+        val scaled = if (bitmap.width > 256 || bitmap.height > 256) {
+            Bitmap.createScaledBitmap(bitmap, 256, 256, true)
+        } else {
+            bitmap
+        }
+        scaled.compress(Bitmap.CompressFormat.JPEG, 80, outputStream)
+        return Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
+    }
+
+    fun playTrack(index: Int, startPosMs: Int = 0) {
+        if (tracks.isEmpty()) return
+        currentIndex = if (index in tracks.indices) index else 0
+        savedResumePositionMs = startPosMs
+
+        getSharedPreferences("hyperion_prefs", Context.MODE_PRIVATE)
+            .edit()
+            .putInt("last_track_index", currentIndex)
+            .putInt("last_track_pos_ms", startPosMs)
+            .apply()
+
+        val track = tracks[currentIndex]
+
+        requestCarAudioFocus()
+        resumeOnFocusGain = false
+
+        currentArtwork = getTrackArtwork(track.path)
+        currentArtworkBase64 = bitmapToBase64(currentArtwork!!)
+
+        if (mediaPlayer == null) {
+            mediaPlayer = MediaPlayer().apply {
+                setWakeMode(applicationContext, PowerManager.PARTIAL_WAKE_LOCK)
+                setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                setOnCompletionListener {
+                    savedResumePositionMs = 0
+                    if (isLoop) {
+                        playTrack(currentIndex, 0)
+                    } else {
+                        playNext()
+                    }
+                }
+            }
+        } else {
+            mediaPlayer?.reset()
+            mediaPlayer?.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+        }
+
+        try {
+            mediaPlayer?.apply {
+                setDataSource(track.path)
+                prepare()
+                if (startPosMs > 0 && startPosMs < duration - 2000) {
+                    seekTo(startPosMs)
+                }
+                start()
+            }
+            applyAudioEffects()
+
+            val durSec = (mediaPlayer?.duration ?: 0) / 1000L
+            savedDurationSec = durSec
+            val curSec = (mediaPlayer?.currentPosition ?: 0) / 1000L
+            updateMetadata(track.title, track.folder, durSec, currentArtwork)
+            updatePlaybackState(true, curSec)
+            startForegroundWithNotification(track.title, true)
+            notifyUi()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    fun playAllRandom() {
+        if (tracks.isEmpty()) return
+        isGlobalShuffle = true
+        isFolderShuffle = false
+        val randomIdx = tracks.indices.random()
+        playTrack(randomIdx, 0)
+    }
+
+    fun resumePlayback() {
+        if (mediaPlayer == null && tracks.isNotEmpty()) {
+            val targetIdx = if (currentIndex in tracks.indices) currentIndex else 0
+            playTrack(targetIdx, savedResumePositionMs)
+        } else {
+            requestCarAudioFocus()
+            resumeOnFocusGain = false
+            mediaPlayer?.start()
+            applyAudioEffects()
+            val pos = (mediaPlayer?.currentPosition ?: 0) / 1000L
+            updatePlaybackState(true, pos)
+            val title = if (currentIndex in tracks.indices) tracks[currentIndex].title else "Hyperion"
+            startForegroundWithNotification(title, true)
+            notifyUi()
+        }
+    }
+
+    fun pausePlayback() {
+        resumeOnFocusGain = false
+        saveCurrentProgress()
+        mediaPlayer?.pause()
+        val pos = (mediaPlayer?.currentPosition ?: savedResumePositionMs) / 1000L
+        updatePlaybackState(false, pos)
+        val title = if (currentIndex in tracks.indices) tracks[currentIndex].title else "Hyperion"
+        startForegroundWithNotification(title, false)
+        notifyUi()
+    }
+
+    fun playNext() {
+        if (tracks.isEmpty()) return
+        if (isLoop) {
+            playTrack(currentIndex, 0)
+            return
+        }
+
+        if (isGlobalShuffle) {
+            val nextIdx = if (tracks.size > 1) {
+                tracks.indices.filter { it != currentIndex }.random()
+            } else 0
+            playTrack(nextIdx, 0)
+            return
+        }
+
+        val currentFolder = if (currentIndex in tracks.indices) tracks[currentIndex].folder else "WSZYSTKIE UTWORY"
+        val folderTracks = if (currentFolder == "WSZYSTKIE UTWORY") tracks else tracks.filter { it.folder.equals(currentFolder, ignoreCase = true) }
+
+        if (isFolderShuffle) {
+            val nextInFolder = if (folderTracks.size > 1) {
+                folderTracks.filter { it.index != currentIndex }.random()
+            } else {
+                folderTracks.firstOrNull() ?: tracks.random()
+            }
+            playTrack(nextInFolder.index, 0)
+            return
+        }
+
+        val currentPosInFolder = folderTracks.indexOfFirst { it.index == currentIndex }
+        val nextInFolder = if (currentPosInFolder >= 0 && folderTracks.isNotEmpty()) {
+            folderTracks[(currentPosInFolder + 1) % folderTracks.size]
+        } else {
+            tracks[(currentIndex + 1) % tracks.size]
+        }
+        playTrack(nextInFolder.index, 0)
+    }
+
+    fun playPrevious() {
+        if (tracks.isEmpty()) return
+        val currentFolder = if (currentIndex in tracks.indices) tracks[currentIndex].folder else "WSZYSTKIE UTWORY"
+        val folderTracks = if (currentFolder == "WSZYSTKIE UTWORY") tracks else tracks.filter { it.folder.equals(currentFolder, ignoreCase = true) }
+        val currentPosInFolder = folderTracks.indexOfFirst { it.index == currentIndex }
+
+        val prevInFolder = if (currentPosInFolder > 0) {
+            folderTracks[currentPosInFolder - 1]
+        } else if (folderTracks.isNotEmpty()) {
+            folderTracks.last()
+        } else {
+            tracks[if (currentIndex - 1 < 0) tracks.size - 1 else currentIndex - 1]
+        }
+        playTrack(prevInFolder.index, 0)
+    }
+
+    fun seekTo(seconds: Long) {
+        val targetMs = (seconds * 1000).toInt()
+        savedResumePositionMs = targetMs
+        getSharedPreferences("hyperion_prefs", Context.MODE_PRIVATE)
+            .edit()
+            .putInt("last_track_pos_ms", targetMs)
+            .apply()
+
+        mediaPlayer?.let {
+            it.seekTo(targetMs)
+            updatePlaybackState(it.isPlaying, seconds)
+            notifyUi()
+        }
+    }
+
+    fun setShuffleState(enabled: Boolean) {
+        isFolderShuffle = enabled
+        isGlobalShuffle = false
+        val pos = (mediaPlayer?.currentPosition ?: savedResumePositionMs) / 1000L
+        updatePlaybackState(mediaPlayer?.isPlaying == true, pos)
+        notifyUi()
+    }
+
+    fun setLoopState(enabled: Boolean) {
+        isLoop = enabled
+        val pos = (mediaPlayer?.currentPosition ?: savedResumePositionMs) / 1000L
+        updatePlaybackState(mediaPlayer?.isPlaying == true, pos)
+        notifyUi()
+    }
+
+    fun setBass(db: Int) {
+        currentBassDb = db
+        applyAudioEffects()
+    }
+
+    fun setVolumeBoost(percent: Int) {
+        currentVolPercent = percent
+        applyAudioEffects()
+    }
+
+    private fun applyAudioEffects() {
+        try {
+            val sessionId = mediaPlayer?.audioSessionId ?: return
+            if (sessionId == 0) return
+
+            if (bassBoost == null || bassBoost?.hasControl() == false) {
+                bassBoost = BassBoost(0, sessionId)
+            }
+            bassBoost?.apply {
+                val strength = (currentBassDb * 50).coerceIn(0, 1000).toShort()
+                setStrength(strength)
+                enabled = (currentBassDb > 0)
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                if (loudnessEnhancer == null || loudnessEnhancer?.hasControl() == false) {
+                    loudnessEnhancer = LoudnessEnhancer(sessionId)
+                }
+                loudnessEnhancer?.apply {
+                    val boostMb = if (currentVolPercent > 100) (currentVolPercent - 100) * 20 else 0
+                    setTargetGain(boostMb)
+                    enabled = (boostMb > 0)
+                }
+            }
+
+            val baseVol = if (currentVolPercent <= 100) currentVolPercent / 100f else 1.0f
+            mediaPlayer?.setVolume(baseVol, baseVol)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun updateMetadata(title: String, artist: String, durationSec: Long, art: Bitmap?) {
+        val metadataBuilder = MediaMetadataCompat.Builder()
+            .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title)
+            .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist)
+            .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, durationSec * 1000)
+
+        if (art != null) {
+            metadataBuilder.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, art)
+            metadataBuilder.putBitmap(MediaMetadataCompat.METADATA_KEY_ART, art)
+            metadataBuilder.putBitmap(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON, art)
+        }
+
+        mediaSession.setMetadata(metadataBuilder.build())
+    }
+
+    private fun updatePlaybackState(isPlaying: Boolean, positionSec: Long) {
+        val state = if (isPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED
+
+        val isAnyShuffleOn = isFolderShuffle || isGlobalShuffle
+        val shuffleIcon = if (isAnyShuffleOn) R.drawable.ic_shuffle_on else R.drawable.ic_shuffle_off
+        val loopIcon = if (isLoop) R.drawable.ic_loop_on else R.drawable.ic_loop_off
+
+        val shuffleTitle = if (isGlobalShuffle) "Losowo: Wszystko" else if (isFolderShuffle) "Losowo: Katalog" else "Losowo: WYŁ"
+        val loopTitle = if (isLoop) "Powtarzaj: WŁ" else "Powtarzaj: WYŁ"
+
+        val shuffleAction = PlaybackStateCompat.CustomAction.Builder(
+            CUSTOM_ACTION_SHUFFLE,
+            shuffleTitle,
+            shuffleIcon
+        ).build()
+
+        val loopAction = PlaybackStateCompat.CustomAction.Builder(
+            CUSTOM_ACTION_LOOP,
+            loopTitle,
+            loopIcon
+        ).build()
+
+        val playbackState = PlaybackStateCompat.Builder()
+            .setActions(
+                PlaybackStateCompat.ACTION_PLAY or
+                        PlaybackStateCompat.ACTION_PAUSE or
+                        PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
+                        PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
+                        PlaybackStateCompat.ACTION_PLAY_FROM_MEDIA_ID or
+                        PlaybackStateCompat.ACTION_SEEK_TO
+            )
+            .addCustomAction(shuffleAction)
+            .addCustomAction(loopAction)
+            .setState(state, positionSec * 1000, 1.0f)
+            .build()
+
+        mediaSession.setPlaybackState(playbackState)
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Hyperion Playback",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Odtwarzanie audio w tle Hyperion -Auto"
+                setShowBadge(false)
+            }
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun startForegroundWithNotification(trackTitle: String, isPlaying: Boolean) {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val prevPendingIntent = PendingIntent.getService(
+            this, 1,
+            Intent(this, HyperionMediaService::class.java).apply { action = ACTION_PREV },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val playPausePendingIntent = PendingIntent.getService(
+            this, 2,
+            Intent(this, HyperionMediaService::class.java).apply {
+                action = if (isPlaying) ACTION_PAUSE else ACTION_PLAY
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val nextPendingIntent = PendingIntent.getService(
+            this, 3,
+            Intent(this, HyperionMediaService::class.java).apply { action = ACTION_NEXT },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val playPauseIcon = if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
+        val playPauseText = if (isPlaying) "Wstrzymaj" else "Odtwórz"
+
+        val mediaStyle = MediaStyle()
+            .setMediaSession(mediaSession.sessionToken)
+            .setShowActionsInCompactView(0, 1, 2)
+
+        val folderName = if (currentIndex in tracks.indices) tracks[currentIndex].folder else "HYPERION // DACIA"
+        val displayTitle = if (trackTitle.isNotBlank()) trackTitle else "HYPERION -AUTO"
+
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(displayTitle)
+            .setContentText(folderName)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentIntent(pendingIntent)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setColor(getSavedColor())
+            .setColorized(true)
+            .setStyle(mediaStyle)
+            .addAction(android.R.drawable.ic_media_previous, "Poprzedni", prevPendingIntent)
+            .addAction(playPauseIcon, playPauseText, playPausePendingIntent)
+            .addAction(android.R.drawable.ic_media_next, "Następny", nextPendingIntent)
+            .setOngoing(isPlaying)
+
+        if (currentArtwork != null) {
+            builder.setLargeIcon(currentArtwork)
+        }
+
+        val notification = builder.build()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun notifyUi() {
+        MainActivity.instance?.let { act ->
+            val isPlaying = mediaPlayer?.isPlaying == true
+            val pos = (mediaPlayer?.currentPosition ?: savedResumePositionMs) / 1000L
+            val dur = if (mediaPlayer != null) (mediaPlayer?.duration ?: 0) / 1000L else savedDurationSec
+            val title = if (currentIndex in tracks.indices) tracks[currentIndex].title else ""
+            val art = currentArtworkBase64
+            val shuffleState = isFolderShuffle || isGlobalShuffle
+            act.runOnUiThread {
+                act.syncStateToWeb(title, isPlaying, pos, dur, currentIndex, art, shuffleState, isLoop)
+            }
+        }
+    }
+
+    fun notifyLibraryChanged() {
+        loadTracksFromStorage()
+        notifyChildrenChanged(MEDIA_ROOT_ID)
+        notifyChildrenChanged(ROOT_FOLDERS_ID)
+    }
+
+    fun getCurrentPlaybackInfo(): JSONObject {
+        val obj = JSONObject()
+        val isPlaying = mediaPlayer?.isPlaying == true
+        obj.put("isPlaying", isPlaying)
+        obj.put("currentIndex", currentIndex)
+        obj.put("currentPosition", (mediaPlayer?.currentPosition ?: savedResumePositionMs) / 1000)
+        obj.put("duration", if (mediaPlayer != null) (mediaPlayer?.duration ?: 0) / 1000 else savedDurationSec)
+        obj.put("isShuffle", isFolderShuffle || isGlobalShuffle)
+        obj.put("isLoop", isLoop)
+        if (currentIndex in tracks.indices) {
+            obj.put("title", tracks[currentIndex].title)
+            obj.put("folder", tracks[currentIndex].folder)
+            obj.put("artwork", currentArtworkBase64)
+        }
+        return obj
+    }
+
+    override fun onDestroy() {
+        saveCurrentProgress()
+        statsHandler.removeCallbacks(statsRunnable)
+        instance = null
+        currentArtwork = null
+        bassBoost?.release()
+        loudnessEnhancer?.release()
+        mediaPlayer?.release()
+        mediaPlayer = null
+        if (::mediaSession.isInitialized) mediaSession.release()
+        super.onDestroy()
+    }
+}
